@@ -731,24 +731,21 @@ if "analysis" in st.session_state:
             if current["mover"] == "you" and current["label"] in ("Inaccuracy", "Mistake", "Blunder"):
                 st.write(f"Engine preferred: **{current['best_san']}**")
                 cache = st.session_state.explanations
-                cache_key = (current["ply"], explanation_mode, show_human_move)
+                cache_key = (current["ply"], explanation_mode)
                 if cache_key not in cache:
                     with st.spinner("Getting explanation..."):
-                        human_move = None
-                        if show_human_move:
-                            human_move = get_human_move(current["fen_before"], stockfish_path, target_elo)
                         alt_sans = current.get("alt_sans", [])
                         if explanation_mode.startswith("AI-rephrased") and gemini_api_key:
                             cache[cache_key] = explain_move_hybrid(
                                 current["fen_before"], current["san"], current["best_san"],
                                 current["cp_loss"], current["label"], gemini_api_key,
-                                alt_sans, human_move
+                                alt_sans
                             )
                         else:
                             cache[cache_key] = explain_move_rule_based(
                                 current["fen_before"], current["san"], current["best_san"],
                                 current["cp_loss"], current["label"],
-                                alt_sans, human_move
+                                alt_sans
                             )
                 st.info(cache[cache_key])
                 if st.session_state.get("last_spoken_ply") != current["ply"]:
