@@ -181,6 +181,14 @@ with st.sidebar.expander("🤖 AI explanations (optional)"):
     gemini_api_key = st.text_input("Gemini API key", type="password",
                                     help="From aistudio.google.com — free, no card required. "
                                          "Leave blank to use the built-in free rule-based explanations instead.")
+    explanation_mode = st.radio(
+        "Explanation style",
+        ["Rule-based (accurate, no AI)", "AI-rephrased (natural wording)"],
+        index=0,
+        help="Rule-based is always factually correct. AI-rephrased keeps the same "
+             "facts but asks Gemini to word them more naturally — turn this off "
+             "anytime if it ever seems off."
+    )
 
 # ---------- Classification ----------
 def classify(cp_loss):
@@ -300,6 +308,67 @@ def explain_move_rule_based(fen_before, played_san, best_san, cp_loss, label):
              f"engine's top choice, **{best_san}** — a **{label}**, though it doesn't fit a "
              f"single simple tactical pattern (worth a closer look on the board).")
 
+def generate_game_review(accuracy, counts, weak_phase, total_moves):
+    """Deterministic 2-3 sentence game review, built from stats already
+    computed — no LLM call, so it's instant and always reliable."""
+    blunders = counts.get("Blunder", 0)
+    mistakes = counts.get("Mistake", 0)
+    inaccuracies = counts.get("Inaccuracy", 0)
+
+    if accuracy >= 90:
+        tier = "a strong, clean game"
+    elif accuracy >= 75:
+        tier = "a solid game with a few slip-ups"
+    elif accuracy >= 55:
+        tier = "an uneven game with some costly errors"
+    else:
+        tier = "a rough game with several serious mistakes"
+
+    parts = [f"This was {tier} — {accuracy:.0f}% accuracy across {total_moves} moves."]
+
+    if blunders >= 2:
+        parts.append(f"{blunders} blunders stand out as the main thing to clean up.")
+    elif blunders == 1:
+        parts.append("One blunder was the costliest moment of the game.")
+    elif mistakes >= 2:
+        parts.append(f"No blunders, but {mistakes} mistakes chipped away at your position.")
+    elif inaccuracies >= 3:
+        parts.append("Nothing too costly, but a handful of inaccuracies added up.")
+    else:
+        parts.append("Very few errors overall — good control of the position throughout.")
+
+    parts.append(f"The {weak_phase} was where most of the trouble happened — that's the phase worth drilling next.")
+    return " ".join(parts)
+
+def explain_move_hybrid(fen_before, played_san, best_san, cp_loss, label, api_key):
+    """Accuracy-first hybrid: the rule-based explainer computes the actual
+    chess facts (always correct, since it reads them straight from the
+    board). If a Gemini key is provided, Gemini's ONLY job is to rephrase
+    that already-correct sentence more naturally — it is explicitly told
+    not to add or change any chess content. Falls back to the plain
+    rule-based text on any failure or suspicious output."""
+    facts_text = explain_move_rule_based(fen_before, played_san, best_san, cp_loss, label)
+    if not api_key:
+        return facts_text
+    try:
+        from google import genai
+        client = genai.Client(api_key=api_key)
+        prompt = (
+            "Rewrite the following chess explanation in 1-2 warm, natural "
+            "sentences for a ~1000 ELO rapid player. Do NOT add, remove, or "
+            "change any move, square, piece, or evaluation — only rephrase "
+            "the wording. Keep any **bolded** move in bold.\n\n"
+            f"Explanation to rephrase: {facts_text}"
+        )
+        response = client.models.generate_content(model="gemini-3.5-flash-lite", contents=prompt)
+        text = (response.text or "").strip()
+        # Sanity checks: reject empty, wildly long, or clearly-broken output
+        if not text or len(text) > 500:
+            return facts_text
+        return text
+    except Exception:
+        return facts_text
+
 def explain_move_gemini(fen_before, played_san, best_san, cp_loss, label, api_key):
     """Plain-English explanation via Google Gemini (free tier). Raises on
     any failure so the caller can fall back to the rule-based explainer."""
@@ -347,6 +416,29 @@ def phase(move_number):
     elif move_number <= 30:
         return "middlegame"
     return "endgame"
+
+import json as _json
+
+def render_tts_button(text, key="tts"):
+    """Free, client-side text-to-speech using the browser's built-in Web
+    Speech API — no API key, no server cost, no external service. Strips
+    markdown bold markers so it doesn't read out the asterisks."""
+    clean_text = text.replace("**", "").replace("_(", "(").replace(")_", ")")
+    safe_text = _json.dumps(clean_text)  # safely escapes quotes/newlines for embedding in JS
+    components.html(f"""
+        <div style="display:flex; align-items:flex-start; height:100%;">
+        <button onclick="
+            var synth = window.speechSynthesis;
+            synth.cancel();
+            var u = new SpeechSynthesisUtterance({safe_text});
+            u.rate = 0.95;
+            synth.speak(u);
+        " style="
+            background-color:#81b64c; color:white; border:none; border-radius:8px;
+            padding:8px 10px; font-size:1.1em; cursor:pointer; width:100%;
+        " title="Play explanation aloud">🔊</button>
+        </div>
+    """, height=48)
 
 def render_board(fen, lastmove=None, flipped=False, size=440):
     board = chess.Board(fen)
@@ -495,6 +587,8 @@ if "analysis" in st.session_state:
     """, unsafe_allow_html=True)
 
     weak_phase = max(phase_stats, key=lambda p: sum(phase_stats[p]) if phase_stats[p] else 0)
+    st.write(generate_game_review(accuracy, counts, weak_phase, total))
+
     with st.expander(f"Weakest phase: {weak_phase.title()} — suggested drills"):
         for d in DRILLS[weak_phase]:
             st.write(f"- {d}")
@@ -527,13 +621,23 @@ if "analysis" in st.session_state:
             if current["mover"] == "you" and current["label"] in ("Inaccuracy", "Mistake", "Blunder"):
                 st.write(f"Engine preferred: **{current['best_san']}**")
                 cache = st.session_state.explanations
-                if current["ply"] not in cache:
+                cache_key = (current["ply"], explanation_mode)
+                if cache_key not in cache:
                     with st.spinner("Getting explanation..."):
-                        cache[current["ply"]] = explain_move(
-                            current["fen_before"], current["san"], current["best_san"],
-                            current["cp_loss"], current["label"], gemini_api_key
-                        )
-                st.info(cache[current["ply"]])
+                        if explanation_mode.startswith("AI-rephrased") and gemini_api_key:
+                            cache[cache_key] = explain_move_hybrid(
+                                current["fen_before"], current["san"], current["best_san"],
+                                current["cp_loss"], current["label"], gemini_api_key
+                            )
+                        else:
+                            cache[cache_key] = explain_move_rule_based(
+                                current["fen_before"], current["san"], current["best_san"],
+                                current["cp_loss"], current["label"]
+                            )
+                exp_col, audio_col = st.columns([5, 1])
+                exp_col.info(cache[cache_key])
+                with audio_col:
+                    render_tts_button(cache[cache_key], key=f"tts_{current['ply']}")
 
     with list_col:
         st.markdown("**Moves**")
