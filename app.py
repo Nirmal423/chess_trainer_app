@@ -6,8 +6,94 @@ import chess.svg
 import streamlit.components.v1 as components
 import requests
 import io
+import sqlite3
+import json
+import random
+from datetime import datetime, timezone
 
 st.set_page_config(page_title="Chess Trainer", layout="wide", page_icon="♞")
+
+# ---------- History database (SQLite) ----------
+# NOTE: on Streamlit Cloud's free tier this file lives on ephemeral storage —
+# it persists while the app stays running, but gets wiped on every redeploy
+# (new git push) or after the app has been idle long enough to fully restart.
+# Good enough for tracking trends between deploys; not a durable long-term
+# store. Migrating to an external DB (e.g. a free Supabase/Postgres instance)
+# would fix that if it becomes worth the extra setup later.
+DB_PATH = "chess_trainer_history.db"
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""CREATE TABLE IF NOT EXISTS games (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        game_url TEXT UNIQUE,
+        played_at TEXT,
+        analyzed_at TEXT,
+        opening_name TEXT,
+        eco TEXT,
+        user_color TEXT,
+        result TEXT,
+        accuracy REAL,
+        blunders INTEGER,
+        mistakes INTEGER,
+        inaccuracies INTEGER,
+        weak_phase TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS blunders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        game_id INTEGER,
+        fen_before TEXT,
+        played_san TEXT,
+        best_san TEXT,
+        motif TEXT,
+        label TEXT,
+        cp_loss INTEGER,
+        FOREIGN KEY(game_id) REFERENCES games(id)
+    )""")
+    return conn
+
+def classify_result(side_result):
+    """Maps chess.com's granular result strings (win/checkmated/resigned/
+    timeout/agreed/repetition/stalemate/...) down to Win/Loss/Draw."""
+    if side_result == "win":
+        return "Win"
+    if side_result in ("agreed", "repetition", "stalemate", "insufficient", "50move", "timevsinsufficient"):
+        return "Draw"
+    return "Loss"
+
+def save_game_to_db(game_url, played_at, opening_name, eco, user_color, result,
+                     accuracy, counts, weak_phase, blunder_entries):
+    """Saves a completed analysis to history. Skips silently if this exact
+    game (by chess.com URL) was already saved, so re-analyzing the same
+    game twice doesn't create duplicates."""
+    try:
+        conn = get_db()
+        cur = conn.execute("SELECT id FROM games WHERE game_url = ?", (game_url,))
+        if cur.fetchone():
+            conn.close()
+            return
+        cur = conn.execute(
+            """INSERT INTO games (game_url, played_at, analyzed_at, opening_name, eco,
+               user_color, result, accuracy, blunders, mistakes, inaccuracies, weak_phase)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (game_url, played_at, datetime.now(timezone.utc).isoformat(), opening_name, eco,
+             user_color, result, accuracy, counts.get("Blunder", 0), counts.get("Mistake", 0),
+             counts.get("Inaccuracy", 0), weak_phase)
+        )
+        game_id = cur.lastrowid
+        for b in blunder_entries:
+            conn.execute(
+                """INSERT INTO blunders (game_id, fen_before, played_san, best_san, motif, label, cp_loss)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (game_id, b["fen_before"], b["san"], b["best_san"], b["motif"], b["label"], b["cp_loss"])
+            )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass  # history saving is a bonus feature — never let it break the main analysis flow
+
+
 
 # ---------- Chess.com / Lichess inspired theme ----------
 st.markdown("""
@@ -313,9 +399,11 @@ PIECE_NAMES = {
 def _piece_name(piece_type):
     return PIECE_NAMES.get(piece_type, "piece")
 
-def explain_move_rule_based(fen_before, played_san, best_san, cp_loss, label, alt_sans=None):
-    """Free, rule-based explanation using python-chess tactical pattern
-    detection — no LLM or API key required."""
+def classify_and_explain(fen_before, played_san, best_san, cp_loss, label, alt_sans=None):
+    """Core rule-based pattern detector — returns (motif_tag, explanation_text).
+    Free, pure python-chess board logic, no LLM or engine call required.
+    explain_move_rule_based() and classify_motif_tag() below are both thin
+    wrappers around this, so the detection logic only lives in one place."""
     board = chess.Board(fen_before)
     mover_color = board.turn
     opponent_word = "Black" if mover_color == chess.WHITE else "White"
@@ -342,7 +430,7 @@ def explain_move_rule_based(fen_before, played_san, best_san, cp_loss, label, al
         b_best = board.copy()
         b_best.push(best_move)
         if b_best.is_checkmate():
-            return add_extras(f"This missed a forced checkmate — **{best_san}** would have "
+            return "Missed mate", add_extras(f"This missed a forced checkmate — **{best_san}** would have "
                      f"ended the game immediately.")
 
     if played_move:
@@ -355,7 +443,7 @@ def explain_move_rule_based(fen_before, played_san, best_san, cp_loss, label, al
             b3.push(resp)
             if b3.is_checkmate():
                 resp_san = board_after.san(resp)
-                return add_extras(f"This allows **{resp_san}**, which is checkmate. "
+                return "Allowed mate", add_extras(f"This allows **{resp_san}**, which is checkmate. "
                          f"The engine's move **{best_san}** would have avoided this.")
 
         # 3. The piece that moved is left hanging (attacked, under-defended)
@@ -375,14 +463,14 @@ def explain_move_rule_based(fen_before, played_san, best_san, cp_loss, label, al
                 )
                 if not defenders or weakest_attacker_val < piece_val:
                     attacker_name = _piece_name(board_after.piece_at(weakest_attacker_sq).piece_type)
-                    return add_extras(f"This leaves your {_piece_name(moved_piece.piece_type)} on "
+                    return "Hanging piece", add_extras(f"This leaves your {_piece_name(moved_piece.piece_type)} on "
                              f"{chess.square_name(dest)} hanging — {opponent_word} can capture it "
                              f"with a {attacker_name} for free. The engine preferred **{best_san}** instead.")
 
         # 4. Walks into a fork
         fork_desc = detect_fork(board_after, mover_color)
         if fork_desc:
-            return add_extras(f"This walks into a fork — {opponent_word} has a move "
+            return "Fork", add_extras(f"This walks into a fork — {opponent_word} has a move "
                      f"{fork_desc}, winning material either way. "
                      f"The engine preferred **{best_san}** instead.")
 
@@ -390,13 +478,13 @@ def explain_move_rule_based(fen_before, played_san, best_san, cp_loss, label, al
         for sq in chess.SQUARES:
             p = board_after.piece_at(sq)
             if p and p.color == mover_color and p.piece_type != chess.KING and board_after.is_pinned(mover_color, sq):
-                return add_extras(f"This leaves your {_piece_name(p.piece_type)} on "
+                return "Pin", add_extras(f"This leaves your {_piece_name(p.piece_type)} on "
                          f"{chess.square_name(sq)} pinned to your king, freezing it in place. "
                          f"The engine preferred **{best_san}** instead.")
 
         # 6. Creates a back-rank weakness
         if detect_back_rank_weakness(board_after, mover_color):
-            return add_extras("This leaves your king boxed in on the back rank by its own pawns — "
+            return "Back-rank weakness", add_extras("This leaves your king boxed in on the back rank by its own pawns — "
                      f"watch out for back-rank checkmate ideas. The engine preferred **{best_san}** instead.")
 
         # 7. Missed a free capture that the engine's move takes
@@ -405,14 +493,27 @@ def explain_move_rule_based(fen_before, played_san, best_san, cp_loss, label, al
             if captured_piece:
                 defenders_of_target = board.attackers(not mover_color, best_move.to_square)
                 if len(defenders_of_target) == 0:
-                    return add_extras(f"You missed winning material — **{best_san}** captures an "
+                    return "Missed capture", add_extras(f"You missed winning material — **{best_san}** captures an "
                              f"undefended {_piece_name(captured_piece.piece_type)}.")
 
     # 8. Fallback: no clean single-pattern match, describe in evaluation terms
     pawns_lost = round(cp_loss / 100, 1)
-    return add_extras(f"This move gives up roughly {pawns_lost} pawns of advantage compared to the "
+    return "Other", add_extras(f"This move gives up roughly {pawns_lost} pawns of advantage compared to the "
              f"engine's top choice, **{best_san}** — a **{label}**, though it doesn't fit a "
              f"single simple tactical pattern (worth a closer look on the board).")
+
+def explain_move_rule_based(fen_before, played_san, best_san, cp_loss, label, alt_sans=None):
+    """Free, rule-based explanation using python-chess tactical pattern
+    detection — no LLM or API key required."""
+    _, text = classify_and_explain(fen_before, played_san, best_san, cp_loss, label, alt_sans)
+    return text
+
+def classify_motif_tag(fen_before, played_san, best_san, cp_loss, label):
+    """Cheap, engine-free classification used to tag every flagged move for
+    the per-game 'blunder type breakdown' — no alt_sans needed here since
+    we only want the tag, not the MultiPV-aware explanation text."""
+    tag, _ = classify_and_explain(fen_before, played_san, best_san, cp_loss, label)
+    return tag
 
 def generate_game_review(accuracy, counts, weak_phase, total_moves):
     """Deterministic 2-3 sentence game review, built from stats already
@@ -575,8 +676,95 @@ def go_start():
 def go_end():
     st.session_state.ply_index = len(st.session_state.analysis["positions"]) - 1
 
-# ---------- Main flow ----------
-username = st.text_input("chess.com username")
+# ---------- Trends & Puzzles (from saved history) ----------
+with st.expander("📈 Your progress across games"):
+    conn = get_db()
+    game_rows = conn.execute("SELECT * FROM games ORDER BY played_at ASC").fetchall()
+    blunder_rows = conn.execute("SELECT motif FROM blunders").fetchall()
+    conn.close()
+
+    if not game_rows:
+        st.caption("Analyze a few games below and your trends will show up here.")
+    else:
+        st.caption(f"Based on {len(game_rows)} analyzed game(s) saved so far.")
+
+        # Recurring blunder type across ALL games
+        motif_totals = {}
+        for row in blunder_rows:
+            motif = row["motif"]
+            motif_totals[motif] = motif_totals.get(motif, 0) + 1
+        if motif_totals:
+            st.write("**Your most common mistake types (all games):**")
+            sorted_motifs = dict(sorted(motif_totals.items(), key=lambda x: -x[1]))
+            st.bar_chart(sorted_motifs)
+
+        # Accuracy over time (all games, chronological)
+        if len(game_rows) >= 2:
+            st.write("**Accuracy trend over time:**")
+            accuracies = {i + 1: row["accuracy"] for i, row in enumerate(game_rows)}
+            st.line_chart(accuracies)
+
+        # Opening performance
+        opening_stats = {}
+        for row in game_rows:
+            opening = row["opening_name"]
+            acc = row["accuracy"]
+            result = row["result"]
+            if opening not in opening_stats:
+                opening_stats[opening] = {"count": 0, "acc_sum": 0, "wins": 0}
+            opening_stats[opening]["count"] += 1
+            opening_stats[opening]["acc_sum"] += acc
+            if result == "Win":
+                opening_stats[opening]["wins"] += 1
+
+        if opening_stats:
+            st.write("**Opening performance:**")
+            for opening, s in sorted(opening_stats.items(), key=lambda x: -x[1]["count"]):
+                avg_acc = s["acc_sum"] / s["count"]
+                win_rate = 100 * s["wins"] / s["count"]
+                st.write(f"- **{opening}** — {s['count']} game(s), {avg_acc:.0f}% avg accuracy, {win_rate:.0f}% win rate")
+
+with st.expander("🧩 Practice your own blunders"):
+    conn = get_db()
+    puzzle_rows = conn.execute(
+        "SELECT fen_before, played_san, best_san, motif FROM blunders ORDER BY RANDOM() LIMIT 1"
+    ).fetchall()
+    conn.close()
+
+    if not puzzle_rows:
+        st.caption("No blunders saved yet — analyze a game below, and any mistakes will show up here as puzzles to practice.")
+    else:
+        fen_before, played_san, best_san, motif = puzzle_rows[0]
+
+        if st.session_state.get("puzzle_fen") != fen_before:
+            st.session_state.puzzle_fen = fen_before
+            st.session_state.puzzle_best = best_san
+            st.session_state.puzzle_motif = motif
+            b = chess.Board(fen_before)
+            legal_sans = [b.san(m) for m in b.legal_moves]
+            distractors = [s for s in legal_sans if s != best_san]
+            random.shuffle(distractors)
+            options = [best_san] + distractors[:3]
+            random.shuffle(options)
+            st.session_state.puzzle_options = options
+            st.session_state.puzzle_answered = False
+
+        render_board(st.session_state.puzzle_fen, size=280)
+        st.write(f"**What's the best move here?** _(pattern: {st.session_state.puzzle_motif})_")
+
+        cols = st.columns(len(st.session_state.puzzle_options))
+        for i, opt in enumerate(st.session_state.puzzle_options):
+            if cols[i].button(opt, key=f"puzzle_opt_{i}", use_container_width=True):
+                st.session_state.puzzle_answered = opt
+
+        if st.session_state.get("puzzle_answered"):
+            if st.session_state.puzzle_answered == st.session_state.puzzle_best:
+                st.success(f"Correct! **{st.session_state.puzzle_best}** was the best move.")
+            else:
+                st.error(f"Not quite — the best move was **{st.session_state.puzzle_best}**.")
+            if st.button("Next puzzle"):
+                st.session_state.puzzle_fen = None
+                st.rerun()
 
 if username:
     try:
@@ -608,6 +796,14 @@ if username:
         pgn_io = io.StringIO(selected_game["pgn"])
         game = chess.pgn.read_game(pgn_io)
         board = game.board()
+
+        eco = game.headers.get("ECO", "")
+        eco_url = game.headers.get("ECOUrl", "")
+        if eco_url:
+            opening_name = eco_url.rstrip("/").split("/")[-1].replace("-", " ")
+        else:
+            opening_name = "Unknown opening"
+        st.session_state.opening_info = f"{opening_name}" + (f" ({eco})" if eco else "")
 
         user_is_white = selected_game.get("white", {}).get("username", "").lower() == username.lower()
         user_color = chess.WHITE if user_is_white else chess.BLACK
@@ -663,6 +859,40 @@ if username:
 
             engine.quit()
 
+            for entry in results:
+                entry["motif"] = classify_motif_tag(
+                    entry["fen_before"], entry["san"], entry["best_san"],
+                    entry["cp_loss"], entry["label"]
+                )
+
+            # Compute the same summary stats the display section will show,
+            # so history is saved in sync with what you actually see.
+            _user_moves = [p for p in positions if p["mover"] == "you"]
+            _counts = {}
+            for r in _user_moves:
+                _counts[r["label"]] = _counts.get(r["label"], 0) + 1
+            _total = len(_user_moves)
+            _accuracy = 100 * sum(1 for r in _user_moves if r["label"] in ("Best", "Good")) / _total if _total else 0
+            _weak_phase = max(phase_stats, key=lambda p: sum(phase_stats[p]) if phase_stats[p] else 0)
+
+            side_key = "white" if user_is_white else "black"
+            user_result = classify_result(selected_game.get(side_key, {}).get("result", ""))
+            end_ts = selected_game.get("end_time")
+            played_at = datetime.fromtimestamp(end_ts, tz=timezone.utc).isoformat() if end_ts else datetime.now(timezone.utc).isoformat()
+
+            save_game_to_db(
+                game_url=selected_game.get("url", f"unknown-{played_at}"),
+                played_at=played_at,
+                opening_name=opening_name,
+                eco=eco,
+                user_color="White" if user_is_white else "Black",
+                result=user_result,
+                accuracy=_accuracy,
+                counts=_counts,
+                weak_phase=_weak_phase,
+                blunder_entries=results,
+            )
+
         st.session_state.analysis = {
             "positions": positions, "results": results, "phase_stats": phase_stats,
             "user_color": user_color, "flipped": (user_color == chess.BLACK)
@@ -680,6 +910,9 @@ if "analysis" in st.session_state:
     phase_stats = data["phase_stats"]
 
     st.subheader("Summary")
+    if st.session_state.get("opening_info"):
+        st.caption(f"♟️ Opening: {st.session_state.opening_info}")
+
     counts = {}
     user_moves = [p for p in positions if p["mover"] == "you"]
     for r in user_moves:
@@ -706,6 +939,14 @@ if "analysis" in st.session_state:
     with st.expander(f"Weakest phase: {weak_phase.title()} — suggested drills"):
         for d in DRILLS[weak_phase]:
             st.write(f"- {d}")
+
+    if results:
+        motif_counts = {}
+        for r in results:
+            motif_counts[r["motif"]] = motif_counts.get(r["motif"], 0) + 1
+        with st.expander("What kind of mistakes did you make?"):
+            for motif, n in sorted(motif_counts.items(), key=lambda x: -x[1]):
+                st.write(f"- **{motif}**: {n}")
 
     flipped = st.checkbox("Flip board", value=data["flipped"])
     current = positions[st.session_state.ply_index]
