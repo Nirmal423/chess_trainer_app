@@ -466,7 +466,7 @@ if "analysis" in st.session_state:
 
     st.divider()
     st.header("Flagged moves — click to jump")
-    for r in results:
+    for r in results:git remote add origin 
         cols = st.columns([5, 1])
         cols[0].markdown(
             f'<span class="move-label {r["cls"]}">{r["icon"]} Move {r["ply"]}: {r["san"]} — {r["label"]}</span>',
