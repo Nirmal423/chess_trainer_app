@@ -173,14 +173,7 @@ with st.sidebar.expander("⚙️ Engine setup", expanded=not bool(_auto_stockfis
     )
 
 with st.sidebar.expander("📊 Analysis settings", expanded=True):
-    target_elo = st.slider(
-        "Analysis engine strength (ELO)", 1320, 3190, 1500, step=50,
-        help="Controls how strong Stockfish plays when reviewing your game. Lower "
-             "settings (e.g. 1320-1600) give more human, learnable 'best moves' and "
-             "explanations — closer to what a player at that level would actually "
-             "find. Higher settings give the objectively strongest, but sometimes "
-             "less intuitive, engine lines. (Stockfish's own floor is 1320.)"
-    )
+    analysis_depth = st.slider("Analysis depth", 8, 20, 14)
     board_size = st.slider("Board size", 260, 480, 320, step=20)
 
 with st.sidebar.expander("🤖 AI explanations (optional)"):
@@ -223,16 +216,12 @@ def get_games(archive_url):
     r.raise_for_status()
     return r.json()["games"]
 
-# Fixed internal search depth — no longer user-facing. Now that engine strength
-# is controlled directly via UCI_Elo (see sidebar), a separate depth slider
-# would be redundant: UCI_LimitStrength already governs how "hard" the engine
-# looks, so this constant just gives it enough room to do that at any ELO.
-ANALYSIS_DEPTH = 15
-
-def eval_and_best(board, engine, depth, multipv=3):
-    """Returns (score, best_move, alt_sans) where alt_sans is the SAN of the
-    engine's 2nd/3rd choice moves — asked for in a single engine call via
-    MultiPV, so this costs almost nothing extra over asking for just 1 line."""
+def eval_and_best(board, engine, depth, multipv=1):
+    """Returns (score, best_move, alt_sans). Defaults to MultiPV=1 (fast) —
+    used for the full-game scan, where we only need the single best line
+    for every move. The richer top-3 alt_sans (for the '2nd/3rd choice'
+    explanation note) are fetched separately and lazily, only for the one
+    flagged move you're actually viewing — see get_alt_sans() below."""
     infos = engine.analyse(board, chess.engine.Limit(depth=depth), multipv=multipv)
     if isinstance(infos, dict):
         infos = [infos]
@@ -248,6 +237,23 @@ def eval_and_best(board, engine, depth, multipv=3):
             except Exception:
                 pass
     return score, best_move, alt_sans
+
+def get_alt_sans(fen, stockfish_path, depth):
+    """Lazily fetches the engine's 2nd/3rd choice moves for a single
+    position — only called when displaying the explanation for a flagged
+    move, not during the bulk game scan. Spins up a short-lived, full-
+    strength engine since the main analysis engine has already been closed
+    by this point."""
+    try:
+        board = chess.Board(fen)
+        eng = chess.engine.SimpleEngine.popen_uci(stockfish_path)
+        try:
+            _, _, alt_sans = eval_and_best(board, eng, depth, multipv=3)
+            return alt_sans
+        finally:
+            eng.quit()
+    except Exception:
+        return []
 
 def detect_fork(board_after, mover_color):
     """Checks if the opponent now has a move where a single piece attacks
@@ -609,7 +615,6 @@ if username:
         with st.spinner("Running Stockfish analysis..."):
             try:
                 engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
-                engine.configure({"UCI_LimitStrength": True, "UCI_Elo": int(target_elo)})
             except Exception as e:
                 st.error(f"Couldn't start Stockfish at that path: {e}")
                 st.stop()
@@ -619,7 +624,7 @@ if username:
             results = []
             phase_stats = {"opening": [], "middlegame": [], "endgame": []}
 
-            current_eval, current_best, current_alts = eval_and_best(board, engine, ANALYSIS_DEPTH)
+            current_eval, current_best, _ = eval_and_best(board, engine, analysis_depth)
             move_number = 0
 
             for move in game.mainline_moves():
@@ -631,7 +636,7 @@ if username:
                 best_san = board.san(best_move) if best_move else played_san
 
                 board.push(move)
-                eval_after, next_best, next_alts = eval_and_best(board, engine, ANALYSIS_DEPTH)
+                eval_after, next_best, _ = eval_and_best(board, engine, analysis_depth)
 
                 if board.turn == chess.BLACK:  # white just moved
                     cp_loss = max(0, eval_before - eval_after)
@@ -646,7 +651,6 @@ if username:
                     "mover": "you" if mover_is_user else "opponent",
                     "cp_loss": cp_loss, "label": label, "icon": icon, "cls": cls,
                     "best_san": best_san, "fen_before": fen_before, "phase": ph,
-                    "alt_sans": current_alts,
                 }
                 positions.append(entry)
 
@@ -655,7 +659,7 @@ if username:
                     if label in ("Inaccuracy", "Mistake", "Blunder"):
                         results.append(entry)
 
-                current_eval, current_best, current_alts = eval_after, next_best, next_alts
+                current_eval, current_best = eval_after, next_best
 
             engine.quit()
 
@@ -734,7 +738,7 @@ if "analysis" in st.session_state:
                 cache_key = (current["ply"], explanation_mode)
                 if cache_key not in cache:
                     with st.spinner("Getting explanation..."):
-                        alt_sans = current.get("alt_sans", [])
+                        alt_sans = get_alt_sans(current["fen_before"], stockfish_path, analysis_depth)
                         if explanation_mode.startswith("AI-rephrased") and gemini_api_key:
                             cache[cache_key] = explain_move_hybrid(
                                 current["fen_before"], current["san"], current["best_san"],
