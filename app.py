@@ -7,7 +7,7 @@ import streamlit.components.v1 as components
 import requests
 import io
 
-st.set_page_config(page_title="Chess Trainer", layout="wide", page_icon="♟️")
+st.set_page_config(page_title="Chess Trainer", layout="wide", page_icon="♞")
 
 # ---------- Chess.com / Lichess inspired theme ----------
 st.markdown("""
@@ -63,10 +63,76 @@ section[data-testid="stSidebar"] .stNumberInput label {
   font-weight: 600 !important;
   opacity: 1 !important;
 }
+
+/* Fix low-contrast labels EVERYWHERE (sidebar and main body) */
+label, label p,
+.stSlider label, .stTextInput label, .stNumberInput label, .stSelectbox label,
+div[data-baseweb="select"] * {
+  color: var(--cc-text) !important;
+  font-weight: 600 !important;
+  opacity: 1 !important;
+  -webkit-text-fill-color: var(--cc-text) !important;
+}
+
+/* Sidebar expander headers — make them stand out clearly, in BOTH collapsed and expanded state */
+section[data-testid="stSidebar"] details summary,
+section[data-testid="stSidebar"] details[open] summary {
+  background-color: #3a3733 !important;
+  border-radius: 6px !important;
+  padding: 8px 10px !important;
+  border: 1px solid var(--cc-green) !important;
+}
+section[data-testid="stSidebar"] details summary span,
+section[data-testid="stSidebar"] details summary p,
+section[data-testid="stSidebar"] details[open] summary span,
+section[data-testid="stSidebar"] details[open] summary p {
+  color: #ffffff !important;
+  -webkit-text-fill-color: #ffffff !important;
+  font-weight: 700 !important;
+  font-size: 1.02em !important;
+  opacity: 1 !important;
+}
+/* Expander collapse/expand chevron icon — force it visible (light) in both states */
+section[data-testid="stSidebar"] details summary svg,
+section[data-testid="stSidebar"] details[open] summary svg {
+  fill: #ffffff !important;
+  stroke: #ffffff !important;
+  opacity: 1 !important;
+}
+
+/* API key / text inputs — stronger border so they don't blend into the dark bg */
+section[data-testid="stSidebar"] input {
+  border: 1.5px solid var(--cc-green) !important;
+  background-color: #1c1a18 !important;
+  color: var(--cc-text) !important;
+}
+
+/* Compact nav row: tight, equal-width, side-by-side buttons even on narrow screens */
+.nav-row div[data-testid="column"] {
+  padding: 0 3px !important;
+  min-width: 0 !important;
+}
+.nav-row div.stButton > button {
+  padding: 6px 0 !important;
+  font-size: 1.1em !important;
+  width: 100% !important;
+}
+
+/* Compact horizontal stat strip for mobile — stays in one row, never stacks */
+.stat-strip {
+  display: flex; gap: 8px; overflow-x: auto; margin-bottom: 10px;
+}
+.stat-chip {
+  background-color: var(--cc-panel); border: 1px solid #3d3a36; border-radius: 8px;
+  padding: 8px 12px; flex: 1; min-width: 70px; text-align: center;
+}
+.stat-chip .stat-val { font-size: 1.3em; font-weight: 700; color: var(--cc-text); }
+.stat-chip .stat-lbl { font-size: 0.72em; color: var(--cc-muted); font-weight: 600; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("♟️ Chess Improvement Trainer")
+st.title("♞ Chess Improvement Trainer")
+st.caption("📱 On phone: tap the **›** arrow top-left to open Setup/AI settings.")
 
 # ---------- Sidebar config ----------
 st.sidebar.header("Setup")
@@ -89,7 +155,7 @@ with st.sidebar.expander("⚙️ Engine setup", expanded=not bool(_auto_stockfis
 with st.sidebar.expander("📊 Analysis settings", expanded=True):
     target_elo = st.number_input("Target rapid ELO", value=1200, step=50)
     analysis_depth = st.slider("Analysis depth", 8, 20, 14)
-    board_size = st.slider("Board size", 320, 560, 440, step=20)
+    board_size = st.slider("Board size", 260, 480, 320, step=20)
 
 with st.sidebar.expander("🤖 AI explanations (optional)"):
     gemini_api_key = st.text_input("Gemini API key", type="password",
@@ -391,7 +457,7 @@ if "analysis" in st.session_state:
     results = data["results"]
     phase_stats = data["phase_stats"]
 
-    st.header("Summary")
+    st.subheader("Summary")
     counts = {}
     user_moves = [p for p in positions if p["mover"] == "you"]
     for r in user_moves:
@@ -399,19 +465,19 @@ if "analysis" in st.session_state:
     total = len(user_moves)
     accuracy = 100 * sum(1 for r in user_moves if r["label"] in ("Best", "Good")) / total if total else 0
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Move accuracy", f"{accuracy:.0f}%")
-    c2.metric("Blunders", counts.get("Blunder", 0))
-    c3.metric("Mistakes", counts.get("Mistake", 0))
-    c4.metric("Inaccuracies", counts.get("Inaccuracy", 0))
+    st.markdown(f"""
+    <div class="stat-strip">
+      <div class="stat-chip"><div class="stat-val">{accuracy:.0f}%</div><div class="stat-lbl">ACCURACY</div></div>
+      <div class="stat-chip"><div class="stat-val">{counts.get("Blunder", 0)}</div><div class="stat-lbl">BLUNDERS</div></div>
+      <div class="stat-chip"><div class="stat-val">{counts.get("Mistake", 0)}</div><div class="stat-lbl">MISTAKES</div></div>
+      <div class="stat-chip"><div class="stat-val">{counts.get("Inaccuracy", 0)}</div><div class="stat-lbl">INACCURACIES</div></div>
+    </div>
+    """, unsafe_allow_html=True)
 
     weak_phase = max(phase_stats, key=lambda p: sum(phase_stats[p]) if phase_stats[p] else 0)
-    st.write(f"**Weakest phase: {weak_phase.title()}** — suggested drills:")
-    for d in DRILLS[weak_phase]:
-        st.write(f"- {d}")
-
-    st.divider()
-    st.header("Replay board")
+    with st.expander(f"Weakest phase: {weak_phase.title()} — suggested drills"):
+        for d in DRILLS[weak_phase]:
+            st.write(f"- {d}")
 
     flipped = st.checkbox("Flip board", value=data["flipped"])
     current = positions[st.session_state.ply_index]
@@ -420,12 +486,16 @@ if "analysis" in st.session_state:
 
     with board_col:
         render_board(current["fen"], lastmove=current["move"], flipped=flipped, size=board_size)
-        nc1, nc2, nc3, nc4, nc5 = st.columns([1, 1, 3, 1, 1])
+
+        st.markdown('<div class="nav-row">', unsafe_allow_html=True)
+        nc1, nc2, nc3, nc4 = st.columns(4)
         nc1.button("⏮", on_click=go_start, use_container_width=True)
         nc2.button("◀", on_click=go_prev, use_container_width=True)
-        nc3.slider("Move", 0, len(positions) - 1, key="ply_index", label_visibility="collapsed")
-        nc4.button("▶", on_click=go_next, use_container_width=True)
-        nc5.button("⏭", on_click=go_end, use_container_width=True)
+        nc3.button("▶", on_click=go_next, use_container_width=True)
+        nc4.button("⏭", on_click=go_end, use_container_width=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        st.slider("Move", 0, len(positions) - 1, key="ply_index", label_visibility="collapsed")
 
         if current["ply"] == 0:
             st.write("**Starting position**")
