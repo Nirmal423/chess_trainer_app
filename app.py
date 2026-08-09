@@ -173,8 +173,14 @@ with st.sidebar.expander("⚙️ Engine setup", expanded=not bool(_auto_stockfis
     )
 
 with st.sidebar.expander("📊 Analysis settings", expanded=True):
-    target_elo = st.number_input("Target rapid ELO", value=1200, step=50)
-    analysis_depth = st.slider("Analysis depth", 8, 20, 14)
+    target_elo = st.slider(
+        "Analysis engine strength (ELO)", 1320, 3190, 1500, step=50,
+        help="Controls how strong Stockfish plays when reviewing your game. Lower "
+             "settings (e.g. 1320-1600) give more human, learnable 'best moves' and "
+             "explanations — closer to what a player at that level would actually "
+             "find. Higher settings give the objectively strongest, but sometimes "
+             "less intuitive, engine lines. (Stockfish's own floor is 1320.)"
+    )
     board_size = st.slider("Board size", 260, 480, 320, step=20)
 
 with st.sidebar.expander("🤖 AI explanations (optional)"):
@@ -188,13 +194,6 @@ with st.sidebar.expander("🤖 AI explanations (optional)"):
         help="Rule-based is always factually correct. AI-rephrased keeps the same "
              "facts but asks Gemini to word them more naturally — turn this off "
              "anytime if it ever seems off."
-    )
-    show_human_move = st.checkbox(
-        "Suggest a human-level move (uses a weakened Stockfish)",
-        value=False,
-        help="Instead of only comparing to the engine's absolute best move, also "
-             "shows what a player around your target ELO would plausibly play — "
-             "often a more learnable comparison. Adds a short delay per move."
     )
 
 # ---------- Classification ----------
@@ -224,6 +223,12 @@ def get_games(archive_url):
     r.raise_for_status()
     return r.json()["games"]
 
+# Fixed internal search depth — no longer user-facing. Now that engine strength
+# is controlled directly via UCI_Elo (see sidebar), a separate depth slider
+# would be redundant: UCI_LimitStrength already governs how "hard" the engine
+# looks, so this constant just gives it enough room to do that at any ELO.
+ANALYSIS_DEPTH = 15
+
 def eval_and_best(board, engine, depth, multipv=3):
     """Returns (score, best_move, alt_sans) where alt_sans is the SAN of the
     engine's 2nd/3rd choice moves — asked for in a single engine call via
@@ -243,23 +248,6 @@ def eval_and_best(board, engine, depth, multipv=3):
             except Exception:
                 pass
     return score, best_move, alt_sans
-
-def get_human_move(fen, stockfish_path, elo):
-    """Spins up a short-lived, deliberately weakened Stockfish (via
-    UCI_LimitStrength/UCI_Elo) to find what a player of a given rating would
-    plausibly play here — a more learnable comparison than the engine's
-    absolute best move. Returns SAN, or None on any failure."""
-    try:
-        board = chess.Board(fen)
-        eng = chess.engine.SimpleEngine.popen_uci(stockfish_path)
-        try:
-            eng.configure({"UCI_LimitStrength": True, "UCI_Elo": max(600, min(2800, elo))})
-            result = eng.play(board, chess.engine.Limit(time=0.3))
-            return board.san(result.move) if result.move else None
-        finally:
-            eng.quit()
-    except Exception:
-        return None
 
 def detect_fork(board_after, mover_color):
     """Checks if the opponent now has a move where a single piece attacks
@@ -319,7 +307,7 @@ PIECE_NAMES = {
 def _piece_name(piece_type):
     return PIECE_NAMES.get(piece_type, "piece")
 
-def explain_move_rule_based(fen_before, played_san, best_san, cp_loss, label, alt_sans=None, human_move=None):
+def explain_move_rule_based(fen_before, played_san, best_san, cp_loss, label, alt_sans=None):
     """Free, rule-based explanation using python-chess tactical pattern
     detection — no LLM or API key required."""
     board = chess.Board(fen_before)
@@ -337,16 +325,10 @@ def explain_move_rule_based(fen_before, played_san, best_san, cp_loss, label, al
         best_move = None
 
     def add_extras(text):
-        """Appends the MultiPV close-call note and/or the human-level move
-        suggestion to whichever explanation was generated above, so these
-        richer signals show up regardless of which pattern matched."""
-        extras = []
+        """Appends the MultiPV close-call note to whichever explanation was
+        generated above, so it shows up regardless of which pattern matched."""
         if played_san in alt_sans:
-            extras.append("For what it's worth, this was still the engine's 2nd or 3rd choice — not a random move, just narrowly behind the best line.")
-        if human_move and human_move not in (played_san, best_san):
-            extras.append(f"A player around that rating would likely have played **{human_move}** here instead — a more human, learnable alternative to the engine's top line.")
-        if extras:
-            return text + " " + " ".join(extras)
+            return text + " For what it's worth, this was still the engine's 2nd or 3rd choice — not a random move, just narrowly behind the best line."
         return text
 
     # 1. Missed forced checkmate
@@ -458,14 +440,14 @@ def generate_game_review(accuracy, counts, weak_phase, total_moves):
     parts.append(f"The {weak_phase} was where most of the trouble happened — that's the phase worth drilling next.")
     return " ".join(parts)
 
-def explain_move_hybrid(fen_before, played_san, best_san, cp_loss, label, api_key, alt_sans=None, human_move=None):
+def explain_move_hybrid(fen_before, played_san, best_san, cp_loss, label, api_key, alt_sans=None):
     """Accuracy-first hybrid: the rule-based explainer computes the actual
     chess facts (always correct, since it reads them straight from the
     board). If a Gemini key is provided, Gemini's ONLY job is to rephrase
     that already-correct sentence more naturally — it is explicitly told
     not to add or change any chess content. Falls back to the plain
     rule-based text on any failure or suspicious output."""
-    facts_text = explain_move_rule_based(fen_before, played_san, best_san, cp_loss, label, alt_sans, human_move)
+    facts_text = explain_move_rule_based(fen_before, played_san, best_san, cp_loss, label, alt_sans)
     if not api_key:
         return facts_text
     try:
@@ -627,6 +609,7 @@ if username:
         with st.spinner("Running Stockfish analysis..."):
             try:
                 engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
+                engine.configure({"UCI_LimitStrength": True, "UCI_Elo": int(target_elo)})
             except Exception as e:
                 st.error(f"Couldn't start Stockfish at that path: {e}")
                 st.stop()
@@ -636,7 +619,7 @@ if username:
             results = []
             phase_stats = {"opening": [], "middlegame": [], "endgame": []}
 
-            current_eval, current_best, current_alts = eval_and_best(board, engine, analysis_depth)
+            current_eval, current_best, current_alts = eval_and_best(board, engine, ANALYSIS_DEPTH)
             move_number = 0
 
             for move in game.mainline_moves():
@@ -648,7 +631,7 @@ if username:
                 best_san = board.san(best_move) if best_move else played_san
 
                 board.push(move)
-                eval_after, next_best, next_alts = eval_and_best(board, engine, analysis_depth)
+                eval_after, next_best, next_alts = eval_and_best(board, engine, ANALYSIS_DEPTH)
 
                 if board.turn == chess.BLACK:  # white just moved
                     cp_loss = max(0, eval_before - eval_after)
