@@ -107,15 +107,22 @@ section[data-testid="stSidebar"] input {
   color: var(--cc-text) !important;
 }
 
-/* Compact nav row: tight, equal-width, side-by-side buttons even on narrow screens */
-.nav-row div[data-testid="column"] {
-  padding: 0 3px !important;
-  min-width: 0 !important;
+/* Force the nav button row (immediately after #nav-marker) to stay side-by-side, even on narrow phone screens */
+div:has(> div > #nav-marker) + div[data-testid="stHorizontalBlock"] {
+  flex-wrap: nowrap !important;
+  gap: 6px !important;
 }
-.nav-row div.stButton > button {
+div:has(> div > #nav-marker) + div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+  width: auto !important;
+  flex: 1 1 0 !important;
+  min-width: 0 !important;
+  padding: 0 !important;
+}
+div:has(> div > #nav-marker) + div[data-testid="stHorizontalBlock"] div.stButton > button {
   padding: 6px 0 !important;
   font-size: 1.1em !important;
   width: 100% !important;
+  min-width: 0 !important;
 }
 
 /* Compact horizontal stat strip for mobile — stays in one row, never stacks */
@@ -487,13 +494,12 @@ if "analysis" in st.session_state:
     with board_col:
         render_board(current["fen"], lastmove=current["move"], flipped=flipped, size=board_size)
 
-        st.markdown('<div class="nav-row">', unsafe_allow_html=True)
+        st.markdown('<div id="nav-marker"></div>', unsafe_allow_html=True)
         nc1, nc2, nc3, nc4 = st.columns(4)
         nc1.button("⏮", on_click=go_start, use_container_width=True)
         nc2.button("◀", on_click=go_prev, use_container_width=True)
         nc3.button("▶", on_click=go_next, use_container_width=True)
         nc4.button("⏭", on_click=go_end, use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
 
         st.slider("Move", 0, len(positions) - 1, key="ply_index", label_visibility="collapsed")
 
