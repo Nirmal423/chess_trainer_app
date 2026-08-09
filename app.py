@@ -70,10 +70,13 @@ st.title("♟️ Chess Improvement Trainer")
 
 # ---------- Sidebar config ----------
 st.sidebar.header("Setup")
+import shutil as _shutil
+_auto_stockfish = _shutil.which("stockfish") or _shutil.which("stockfish.exe") or ""
+_default_stockfish = _auto_stockfish or r"C:\Users\Havisha Nirmal\Downloads\stockfish-windows-x86-64-avx2\stockfish\stockfish-windows-x86-64-avx2.exe"
 stockfish_path = st.sidebar.text_input(
     "Stockfish path",
-    value=r"C:\Users\Havisha Nirmal\Downloads\stockfish-windows-x86-64-avx2\stockfish\stockfish-windows-x86-64-avx2.exe",
-    help="Full path to the stockfish .exe"
+    value=_default_stockfish,
+    help="Auto-detected when deployed on Streamlit Cloud. Locally, this is the full path to your stockfish .exe"
 )
 target_elo = st.sidebar.number_input("Target rapid ELO", value=1200, step=50)
 analysis_depth = st.sidebar.slider("Analysis depth", 8, 20, 14)
@@ -466,7 +469,7 @@ if "analysis" in st.session_state:
 
     st.divider()
     st.header("Flagged moves — click to jump")
-    for r in results:git remote add origin 
+    for r in results:
         cols = st.columns([5, 1])
         cols[0].markdown(
             f'<span class="move-label {r["cls"]}">{r["icon"]} Move {r["ply"]}: {r["san"]} — {r["label"]}</span>',
