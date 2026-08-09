@@ -189,6 +189,13 @@ with st.sidebar.expander("🤖 AI explanations (optional)"):
              "facts but asks Gemini to word them more naturally — turn this off "
              "anytime if it ever seems off."
     )
+    show_human_move = st.checkbox(
+        "Suggest a human-level move (uses a weakened Stockfish)",
+        value=False,
+        help="Instead of only comparing to the engine's absolute best move, also "
+             "shows what a player around your target ELO would plausibly play — "
+             "often a more learnable comparison. Adds a short delay per move."
+    )
 
 # ---------- Classification ----------
 def classify(cp_loss):
@@ -217,11 +224,88 @@ def get_games(archive_url):
     r.raise_for_status()
     return r.json()["games"]
 
-def eval_and_best(board, engine, depth):
-    info = engine.analyse(board, chess.engine.Limit(depth=depth))
-    score = info["score"].white().score(mate_score=100000)
-    pv = info.get("pv", [])
-    return score, (pv[0] if pv else None)
+def eval_and_best(board, engine, depth, multipv=3):
+    """Returns (score, best_move, alt_sans) where alt_sans is the SAN of the
+    engine's 2nd/3rd choice moves — asked for in a single engine call via
+    MultiPV, so this costs almost nothing extra over asking for just 1 line."""
+    infos = engine.analyse(board, chess.engine.Limit(depth=depth), multipv=multipv)
+    if isinstance(infos, dict):
+        infos = [infos]
+    score = infos[0]["score"].white().score(mate_score=100000)
+    pv = infos[0].get("pv", [])
+    best_move = pv[0] if pv else None
+    alt_sans = []
+    for info in infos[1:]:
+        alt_pv = info.get("pv", [])
+        if alt_pv:
+            try:
+                alt_sans.append(board.san(alt_pv[0]))
+            except Exception:
+                pass
+    return score, best_move, alt_sans
+
+def get_human_move(fen, stockfish_path, elo):
+    """Spins up a short-lived, deliberately weakened Stockfish (via
+    UCI_LimitStrength/UCI_Elo) to find what a player of a given rating would
+    plausibly play here — a more learnable comparison than the engine's
+    absolute best move. Returns SAN, or None on any failure."""
+    try:
+        board = chess.Board(fen)
+        eng = chess.engine.SimpleEngine.popen_uci(stockfish_path)
+        try:
+            eng.configure({"UCI_LimitStrength": True, "UCI_Elo": max(600, min(2800, elo))})
+            result = eng.play(board, chess.engine.Limit(time=0.3))
+            return board.san(result.move) if result.move else None
+        finally:
+            eng.quit()
+    except Exception:
+        return None
+
+def detect_fork(board_after, mover_color):
+    """Checks if the opponent now has a move where a single piece attacks
+    2+ of the mover's pieces worth a knight or more — a fork. Returns a
+    description string, or None if no fork is found."""
+    opponent = not mover_color
+    for move in board_after.legal_moves:
+        if board_after.turn != opponent:
+            continue
+        piece = board_after.piece_at(move.from_square)
+        if not piece:
+            continue
+        b2 = board_after.copy()
+        b2.push(move)
+        attacked = [
+            sq for sq in chess.SQUARES
+            if b2.piece_at(sq) and b2.piece_at(sq).color == mover_color
+            and PIECE_VALUES.get(b2.piece_at(sq).piece_type, 0) >= 3
+            and b2.is_attacked_by(opponent, sq)
+        ]
+        if len(attacked) >= 2:
+            names = [f"{_piece_name(b2.piece_at(sq).piece_type)} on {chess.square_name(sq)}" for sq in attacked[:2]]
+            return f"forking your {names[0]} and {names[1]}"
+    return None
+
+def detect_back_rank_weakness(board_after, mover_color):
+    """Checks for a classic back-rank mate pattern: the mover's king is
+    boxed in by its own pawns on the home rank with an open file/rank for
+    an opponent rook or queen to deliver check along."""
+    king_sq = board_after.king(mover_color)
+    if king_sq is None:
+        return False
+    home_rank = 0 if mover_color == chess.WHITE else 7
+    if chess.square_rank(king_sq) != home_rank:
+        return False
+    escape_rank = 1 if mover_color == chess.WHITE else 6
+    boxed_in = True
+    for f in (-1, 0, 1):
+        file_ = chess.square_file(king_sq) + f
+        if 0 <= file_ <= 7:
+            sq = chess.square(file_, escape_rank)
+            p = board_after.piece_at(sq)
+            if not (p and p.color == mover_color and p.piece_type == chess.PAWN):
+                boxed_in = False
+                break
+    return boxed_in
 
 PIECE_VALUES = {
     chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
@@ -235,12 +319,13 @@ PIECE_NAMES = {
 def _piece_name(piece_type):
     return PIECE_NAMES.get(piece_type, "piece")
 
-def explain_move_rule_based(fen_before, played_san, best_san, cp_loss, label):
+def explain_move_rule_based(fen_before, played_san, best_san, cp_loss, label, alt_sans=None, human_move=None):
     """Free, rule-based explanation using python-chess tactical pattern
     detection — no LLM or API key required."""
     board = chess.Board(fen_before)
     mover_color = board.turn
     opponent_word = "Black" if mover_color == chess.WHITE else "White"
+    alt_sans = alt_sans or []
 
     try:
         played_move = board.parse_san(played_san)
@@ -251,12 +336,25 @@ def explain_move_rule_based(fen_before, played_san, best_san, cp_loss, label):
     except Exception:
         best_move = None
 
+    def add_extras(text):
+        """Appends the MultiPV close-call note and/or the human-level move
+        suggestion to whichever explanation was generated above, so these
+        richer signals show up regardless of which pattern matched."""
+        extras = []
+        if played_san in alt_sans:
+            extras.append("For what it's worth, this was still the engine's 2nd or 3rd choice — not a random move, just narrowly behind the best line.")
+        if human_move and human_move not in (played_san, best_san):
+            extras.append(f"A player around that rating would likely have played **{human_move}** here instead — a more human, learnable alternative to the engine's top line.")
+        if extras:
+            return text + " " + " ".join(extras)
+        return text
+
     # 1. Missed forced checkmate
     if best_move:
         b_best = board.copy()
         b_best.push(best_move)
         if b_best.is_checkmate():
-            return (f"This missed a forced checkmate — **{best_san}** would have "
+            return add_extras(f"This missed a forced checkmate — **{best_san}** would have "
                      f"ended the game immediately.")
 
     if played_move:
@@ -269,7 +367,7 @@ def explain_move_rule_based(fen_before, played_san, best_san, cp_loss, label):
             b3.push(resp)
             if b3.is_checkmate():
                 resp_san = board_after.san(resp)
-                return (f"This allows **{resp_san}**, which is checkmate. "
+                return add_extras(f"This allows **{resp_san}**, which is checkmate. "
                          f"The engine's move **{best_san}** would have avoided this.")
 
         # 3. The piece that moved is left hanging (attacked, under-defended)
@@ -289,22 +387,42 @@ def explain_move_rule_based(fen_before, played_san, best_san, cp_loss, label):
                 )
                 if not defenders or weakest_attacker_val < piece_val:
                     attacker_name = _piece_name(board_after.piece_at(weakest_attacker_sq).piece_type)
-                    return (f"This leaves your {_piece_name(moved_piece.piece_type)} on "
+                    return add_extras(f"This leaves your {_piece_name(moved_piece.piece_type)} on "
                              f"{chess.square_name(dest)} hanging — {opponent_word} can capture it "
                              f"with a {attacker_name} for free. The engine preferred **{best_san}** instead.")
 
-        # 4. Missed a free capture that the engine's move takes
+        # 4. Walks into a fork
+        fork_desc = detect_fork(board_after, mover_color)
+        if fork_desc:
+            return add_extras(f"This walks into a fork — {opponent_word} has a move "
+                     f"{fork_desc}, winning material either way. "
+                     f"The engine preferred **{best_san}** instead.")
+
+        # 5. Own king left exposed to an absolute pin
+        for sq in chess.SQUARES:
+            p = board_after.piece_at(sq)
+            if p and p.color == mover_color and p.piece_type != chess.KING and board_after.is_pinned(mover_color, sq):
+                return add_extras(f"This leaves your {_piece_name(p.piece_type)} on "
+                         f"{chess.square_name(sq)} pinned to your king, freezing it in place. "
+                         f"The engine preferred **{best_san}** instead.")
+
+        # 6. Creates a back-rank weakness
+        if detect_back_rank_weakness(board_after, mover_color):
+            return add_extras("This leaves your king boxed in on the back rank by its own pawns — "
+                     f"watch out for back-rank checkmate ideas. The engine preferred **{best_san}** instead.")
+
+        # 7. Missed a free capture that the engine's move takes
         if best_move and board.is_capture(best_move) and not board.is_capture(played_move):
             captured_piece = board.piece_at(best_move.to_square)
             if captured_piece:
                 defenders_of_target = board.attackers(not mover_color, best_move.to_square)
                 if len(defenders_of_target) == 0:
-                    return (f"You missed winning material — **{best_san}** captures an "
+                    return add_extras(f"You missed winning material — **{best_san}** captures an "
                              f"undefended {_piece_name(captured_piece.piece_type)}.")
 
-    # 5. Fallback: no clean single-pattern match, describe in evaluation terms
+    # 8. Fallback: no clean single-pattern match, describe in evaluation terms
     pawns_lost = round(cp_loss / 100, 1)
-    return (f"This move gives up roughly {pawns_lost} pawns of advantage compared to the "
+    return add_extras(f"This move gives up roughly {pawns_lost} pawns of advantage compared to the "
              f"engine's top choice, **{best_san}** — a **{label}**, though it doesn't fit a "
              f"single simple tactical pattern (worth a closer look on the board).")
 
@@ -340,14 +458,14 @@ def generate_game_review(accuracy, counts, weak_phase, total_moves):
     parts.append(f"The {weak_phase} was where most of the trouble happened — that's the phase worth drilling next.")
     return " ".join(parts)
 
-def explain_move_hybrid(fen_before, played_san, best_san, cp_loss, label, api_key):
+def explain_move_hybrid(fen_before, played_san, best_san, cp_loss, label, api_key, alt_sans=None, human_move=None):
     """Accuracy-first hybrid: the rule-based explainer computes the actual
     chess facts (always correct, since it reads them straight from the
     board). If a Gemini key is provided, Gemini's ONLY job is to rephrase
     that already-correct sentence more naturally — it is explicitly told
     not to add or change any chess content. Falls back to the plain
     rule-based text on any failure or suspicious output."""
-    facts_text = explain_move_rule_based(fen_before, played_san, best_san, cp_loss, label)
+    facts_text = explain_move_rule_based(fen_before, played_san, best_san, cp_loss, label, alt_sans, human_move)
     if not api_key:
         return facts_text
     try:
@@ -518,7 +636,7 @@ if username:
             results = []
             phase_stats = {"opening": [], "middlegame": [], "endgame": []}
 
-            current_eval, current_best = eval_and_best(board, engine, analysis_depth)
+            current_eval, current_best, current_alts = eval_and_best(board, engine, analysis_depth)
             move_number = 0
 
             for move in game.mainline_moves():
@@ -530,7 +648,7 @@ if username:
                 best_san = board.san(best_move) if best_move else played_san
 
                 board.push(move)
-                eval_after, next_best = eval_and_best(board, engine, analysis_depth)
+                eval_after, next_best, next_alts = eval_and_best(board, engine, analysis_depth)
 
                 if board.turn == chess.BLACK:  # white just moved
                     cp_loss = max(0, eval_before - eval_after)
@@ -544,7 +662,8 @@ if username:
                     "ply": move_number, "fen": board.fen(), "move": move, "san": played_san,
                     "mover": "you" if mover_is_user else "opponent",
                     "cp_loss": cp_loss, "label": label, "icon": icon, "cls": cls,
-                    "best_san": best_san, "fen_before": fen_before, "phase": ph
+                    "best_san": best_san, "fen_before": fen_before, "phase": ph,
+                    "alt_sans": current_alts,
                 }
                 positions.append(entry)
 
@@ -553,7 +672,7 @@ if username:
                     if label in ("Inaccuracy", "Mistake", "Blunder"):
                         results.append(entry)
 
-                current_eval, current_best = eval_after, next_best
+                current_eval, current_best, current_alts = eval_after, next_best, next_alts
 
             engine.quit()
 
@@ -629,18 +748,24 @@ if "analysis" in st.session_state:
             if current["mover"] == "you" and current["label"] in ("Inaccuracy", "Mistake", "Blunder"):
                 st.write(f"Engine preferred: **{current['best_san']}**")
                 cache = st.session_state.explanations
-                cache_key = (current["ply"], explanation_mode)
+                cache_key = (current["ply"], explanation_mode, show_human_move)
                 if cache_key not in cache:
                     with st.spinner("Getting explanation..."):
+                        human_move = None
+                        if show_human_move:
+                            human_move = get_human_move(current["fen_before"], stockfish_path, target_elo)
+                        alt_sans = current.get("alt_sans", [])
                         if explanation_mode.startswith("AI-rephrased") and gemini_api_key:
                             cache[cache_key] = explain_move_hybrid(
                                 current["fen_before"], current["san"], current["best_san"],
-                                current["cp_loss"], current["label"], gemini_api_key
+                                current["cp_loss"], current["label"], gemini_api_key,
+                                alt_sans, human_move
                             )
                         else:
                             cache[cache_key] = explain_move_rule_based(
                                 current["fen_before"], current["san"], current["best_san"],
-                                current["cp_loss"], current["label"]
+                                current["cp_loss"], current["label"],
+                                alt_sans, human_move
                             )
                 st.info(cache[cache_key])
                 if st.session_state.get("last_spoken_ply") != current["ply"]:
