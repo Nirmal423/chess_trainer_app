@@ -422,23 +422,29 @@ import json as _json
 def render_tts_button(text, key="tts"):
     """Free, client-side text-to-speech using the browser's built-in Web
     Speech API — no API key, no server cost, no external service. Strips
-    markdown bold markers so it doesn't read out the asterisks."""
+    markdown bold markers so it doesn't read out the asterisks. Uses an
+    addEventListener in a <script> block (not an inline onclick attribute)
+    because the JSON-escaped text contains double quotes that would
+    otherwise collide with and silently break a double-quoted HTML
+    attribute — that was why the button previously did nothing."""
     clean_text = text.replace("**", "").replace("_(", "(").replace(")_", ")")
     safe_text = _json.dumps(clean_text)  # safely escapes quotes/newlines for embedding in JS
+    btn_id = f"tts-btn-{key}"
     components.html(f"""
-        <div style="display:flex; align-items:flex-start; height:100%;">
-        <button onclick="
+        <button id="{btn_id}" title="Play aloud" style="
+            background-color:#81b64c; color:white; border:none; border-radius:6px;
+            padding:4px 0; font-size:0.95em; cursor:pointer; width:100%; height:34px;
+        ">🔊</button>
+        <script>
+          document.getElementById("{btn_id}").addEventListener("click", function() {{
             var synth = window.speechSynthesis;
             synth.cancel();
             var u = new SpeechSynthesisUtterance({safe_text});
             u.rate = 0.95;
             synth.speak(u);
-        " style="
-            background-color:#81b64c; color:white; border:none; border-radius:8px;
-            padding:8px 10px; font-size:1.1em; cursor:pointer; width:100%;
-        " title="Play explanation aloud">🔊</button>
-        </div>
-    """, height=48)
+          }});
+        </script>
+    """, height=38)
 
 def render_board(fen, lastmove=None, flipped=False, size=440):
     board = chess.Board(fen)
