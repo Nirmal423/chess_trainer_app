@@ -107,18 +107,18 @@ section[data-testid="stSidebar"] input {
   color: var(--cc-text) !important;
 }
 
-/* Force the nav button row (immediately after #nav-marker) to stay side-by-side, even on narrow phone screens */
-div:has(> div > #nav-marker) + div[data-testid="stHorizontalBlock"] {
+/* Force the nav button row to stay side-by-side, even on narrow phone screens */
+div.st-key-nav_buttons div[data-testid="stHorizontalBlock"] {
   flex-wrap: nowrap !important;
   gap: 6px !important;
 }
-div:has(> div > #nav-marker) + div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+div.st-key-nav_buttons div[data-testid="column"] {
   width: auto !important;
   flex: 1 1 0 !important;
   min-width: 0 !important;
   padding: 0 !important;
 }
-div:has(> div > #nav-marker) + div[data-testid="stHorizontalBlock"] div.stButton > button {
+div.st-key-nav_buttons div.stButton > button {
   padding: 6px 0 !important;
   font-size: 1.1em !important;
   width: 100% !important;
@@ -494,12 +494,12 @@ if "analysis" in st.session_state:
     with board_col:
         render_board(current["fen"], lastmove=current["move"], flipped=flipped, size=board_size)
 
-        st.markdown('<div id="nav-marker"></div>', unsafe_allow_html=True)
-        nc1, nc2, nc3, nc4 = st.columns(4)
-        nc1.button("⏮", on_click=go_start, use_container_width=True)
-        nc2.button("◀", on_click=go_prev, use_container_width=True)
-        nc3.button("▶", on_click=go_next, use_container_width=True)
-        nc4.button("⏭", on_click=go_end, use_container_width=True)
+        with st.container(key="nav_buttons"):
+            nc1, nc2, nc3, nc4 = st.columns(4)
+            nc1.button("⏮", on_click=go_start, use_container_width=True)
+            nc2.button("◀", on_click=go_prev, use_container_width=True)
+            nc3.button("▶", on_click=go_next, use_container_width=True)
+            nc4.button("⏭", on_click=go_end, use_container_width=True)
 
         st.slider("Move", 0, len(positions) - 1, key="ply_index", label_visibility="collapsed")
 
