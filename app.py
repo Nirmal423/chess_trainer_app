@@ -70,20 +70,31 @@ st.title("♟️ Chess Improvement Trainer")
 
 # ---------- Sidebar config ----------
 st.sidebar.header("Setup")
-import shutil as _shutil
-_auto_stockfish = _shutil.which("stockfish") or _shutil.which("stockfish.exe") or ""
-_default_stockfish = _auto_stockfish or r"C:\Users\Havisha Nirmal\Downloads\stockfish-windows-x86-64-avx2\stockfish\stockfish-windows-x86-64-avx2.exe"
-stockfish_path = st.sidebar.text_input(
-    "Stockfish path",
-    value=_default_stockfish,
-    help="Auto-detected when deployed on Streamlit Cloud. Locally, this is the full path to your stockfish .exe"
+import shutil as _shutil, os as _os
+_known_linux_paths = ["/usr/games/stockfish", "/usr/bin/stockfish", "/usr/local/bin/stockfish"]
+_auto_stockfish = (
+    _shutil.which("stockfish")
+    or _shutil.which("stockfish.exe")
+    or next((p for p in _known_linux_paths if _os.path.exists(p)), "")
 )
-target_elo = st.sidebar.number_input("Target rapid ELO", value=1200, step=50)
-analysis_depth = st.sidebar.slider("Analysis depth", 8, 20, 14)
-board_size = st.sidebar.slider("Board size", 320, 560, 440, step=20)
-gemini_api_key = st.sidebar.text_input("Gemini API key (optional)", type="password",
-                                        help="From aistudio.google.com — free, no card required. "
-                                             "Leave blank to use the built-in free rule-based explanations instead.")
+_default_stockfish = _auto_stockfish or r"C:\Users\Havisha Nirmal\Downloads\stockfish-windows-x86-64-avx2\stockfish\stockfish-windows-x86-64-avx2.exe"
+
+with st.sidebar.expander("⚙️ Engine setup", expanded=not bool(_auto_stockfish)):
+    stockfish_path = st.text_input(
+        "Stockfish path",
+        value=_default_stockfish,
+        help="Auto-detected when deployed on Streamlit Cloud. Locally, this is the full path to your stockfish .exe"
+    )
+
+with st.sidebar.expander("📊 Analysis settings", expanded=True):
+    target_elo = st.number_input("Target rapid ELO", value=1200, step=50)
+    analysis_depth = st.slider("Analysis depth", 8, 20, 14)
+    board_size = st.slider("Board size", 320, 560, 440, step=20)
+
+with st.sidebar.expander("🤖 AI explanations (optional)"):
+    gemini_api_key = st.text_input("Gemini API key", type="password",
+                                    help="From aistudio.google.com — free, no card required. "
+                                         "Leave blank to use the built-in free rule-based explanations instead.")
 
 # ---------- Classification ----------
 def classify(cp_loss):
