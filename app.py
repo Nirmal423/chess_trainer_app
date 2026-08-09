@@ -766,6 +766,9 @@ with st.expander("🧩 Practice your own blunders"):
                 st.session_state.puzzle_fen = None
                 st.rerun()
 
+# ---------- Main flow ----------
+username = st.text_input("chess.com username")
+
 if username:
     try:
         archives = get_archives(username)
