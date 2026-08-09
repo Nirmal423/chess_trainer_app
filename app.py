@@ -107,23 +107,24 @@ section[data-testid="stSidebar"] input {
   color: var(--cc-text) !important;
 }
 
-/* Force the nav button row to stay side-by-side, fully contained within the screen width */
+/* Force the nav button row into a hard 4-column grid — bypasses Streamlit's inline flex-basis on columns */
 div.st-key-nav_buttons {
   width: 100% !important;
   max-width: 100% !important;
   overflow: hidden !important;
 }
 div.st-key-nav_buttons div[data-testid="stHorizontalBlock"] {
-  flex-wrap: nowrap !important;
+  display: grid !important;
+  grid-template-columns: repeat(4, minmax(0, 1fr)) !important;
   gap: 4px !important;
   width: 100% !important;
   max-width: 100% !important;
 }
 div.st-key-nav_buttons div[data-testid="column"] {
-  flex: 1 1 0 !important;
-  width: 0 !important;
+  width: 100% !important;
   min-width: 0 !important;
   max-width: none !important;
+  flex: none !important;
   padding: 0 !important;
 }
 div.st-key-nav_buttons div.stButton {
