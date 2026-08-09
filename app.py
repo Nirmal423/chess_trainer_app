@@ -107,22 +107,34 @@ section[data-testid="stSidebar"] input {
   color: var(--cc-text) !important;
 }
 
-/* Force the nav button row to stay side-by-side, even on narrow phone screens */
+/* Force the nav button row to stay side-by-side, fully contained within the screen width */
+div.st-key-nav_buttons {
+  width: 100% !important;
+  max-width: 100% !important;
+  overflow: hidden !important;
+}
 div.st-key-nav_buttons div[data-testid="stHorizontalBlock"] {
   flex-wrap: nowrap !important;
-  gap: 6px !important;
+  gap: 4px !important;
+  width: 100% !important;
+  max-width: 100% !important;
 }
 div.st-key-nav_buttons div[data-testid="column"] {
-  width: auto !important;
   flex: 1 1 0 !important;
+  width: 0 !important;
   min-width: 0 !important;
+  max-width: none !important;
   padding: 0 !important;
 }
+div.st-key-nav_buttons div.stButton {
+  width: 100% !important;
+}
 div.st-key-nav_buttons div.stButton > button {
-  padding: 6px 0 !important;
-  font-size: 1.1em !important;
+  padding: 4px 0 !important;
+  font-size: 0.95em !important;
   width: 100% !important;
   min-width: 0 !important;
+  box-sizing: border-box !important;
 }
 
 /* Compact horizontal stat strip for mobile — stays in one row, never stacks */
