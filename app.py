@@ -419,32 +419,28 @@ def phase(move_number):
 
 import json as _json
 
-def render_tts_button(text, key="tts"):
+def render_autoplay_tts(text, key="tts"):
     """Free, client-side text-to-speech using the browser's built-in Web
-    Speech API — no API key, no server cost, no external service. Strips
-    markdown bold markers so it doesn't read out the asterisks. Uses an
-    addEventListener in a <script> block (not an inline onclick attribute)
-    because the JSON-escaped text contains double quotes that would
-    otherwise collide with and silently break a double-quoted HTML
-    attribute — that was why the button previously did nothing."""
+    Speech API — no API key, no server cost, no external service. Plays
+    automatically as soon as this component renders (no button needed).
+    Strips markdown bold markers so it doesn't read out the asterisks.
+    Invisible (height=0) since there's nothing to click.
+
+    Note: some mobile browsers (iOS Safari in particular) restrict
+    autoplaying audio until the user has tapped something on the page —
+    once you've tapped Prev/Next once, this should work reliably for the
+    rest of the session."""
     clean_text = text.replace("**", "").replace("_(", "(").replace(")_", ")")
     safe_text = _json.dumps(clean_text)  # safely escapes quotes/newlines for embedding in JS
-    btn_id = f"tts-btn-{key}"
     components.html(f"""
-        <button id="{btn_id}" title="Play aloud" style="
-            background-color:#81b64c; color:white; border:none; border-radius:6px;
-            padding:4px 0; font-size:0.95em; cursor:pointer; width:100%; height:34px;
-        ">🔊</button>
         <script>
-          document.getElementById("{btn_id}").addEventListener("click", function() {{
-            var synth = window.speechSynthesis;
-            synth.cancel();
-            var u = new SpeechSynthesisUtterance({safe_text});
-            u.rate = 0.95;
-            synth.speak(u);
-          }});
+          var synth = window.speechSynthesis;
+          synth.cancel();
+          var u = new SpeechSynthesisUtterance({safe_text});
+          u.rate = 0.95;
+          synth.speak(u);
         </script>
-    """, height=38)
+    """, height=0)
 
 def render_board(fen, lastmove=None, flipped=False, size=440):
     board = chess.Board(fen)
@@ -567,6 +563,8 @@ if username:
         }
         st.session_state.ply_index = 0
         st.session_state.explanations = {}
+        st.session_state.last_spoken_ply = None
+        st.session_state.review_spoken = False
 
 # ---------- Display (persists across nav clicks) ----------
 if "analysis" in st.session_state:
@@ -593,7 +591,11 @@ if "analysis" in st.session_state:
     """, unsafe_allow_html=True)
 
     weak_phase = max(phase_stats, key=lambda p: sum(phase_stats[p]) if phase_stats[p] else 0)
-    st.write(generate_game_review(accuracy, counts, weak_phase, total))
+    review_text = generate_game_review(accuracy, counts, weak_phase, total)
+    st.write(review_text)
+    if not st.session_state.get("review_spoken"):
+        render_autoplay_tts(review_text, key="tts_review")
+        st.session_state.review_spoken = True
 
     with st.expander(f"Weakest phase: {weak_phase.title()} — suggested drills"):
         for d in DRILLS[weak_phase]:
@@ -640,10 +642,10 @@ if "analysis" in st.session_state:
                                 current["fen_before"], current["san"], current["best_san"],
                                 current["cp_loss"], current["label"]
                             )
-                exp_col, audio_col = st.columns([5, 1])
-                exp_col.info(cache[cache_key])
-                with audio_col:
-                    render_tts_button(cache[cache_key], key=f"tts_{current['ply']}")
+                st.info(cache[cache_key])
+                if st.session_state.get("last_spoken_ply") != current["ply"]:
+                    render_autoplay_tts(cache[cache_key], key=f"tts_{current['ply']}")
+                    st.session_state.last_spoken_ply = current["ply"]
 
     with list_col:
         st.markdown("**Moves**")
