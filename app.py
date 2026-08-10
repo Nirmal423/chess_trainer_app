@@ -6,94 +6,8 @@ import chess.svg
 import streamlit.components.v1 as components
 import requests
 import io
-import sqlite3
-import json
-import random
-from datetime import datetime, timezone
 
 st.set_page_config(page_title="Chess Trainer", layout="wide", page_icon="♞")
-
-# ---------- History database (SQLite) ----------
-# NOTE: on Streamlit Cloud's free tier this file lives on ephemeral storage —
-# it persists while the app stays running, but gets wiped on every redeploy
-# (new git push) or after the app has been idle long enough to fully restart.
-# Good enough for tracking trends between deploys; not a durable long-term
-# store. Migrating to an external DB (e.g. a free Supabase/Postgres instance)
-# would fix that if it becomes worth the extra setup later.
-DB_PATH = "chess_trainer_history.db"
-
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("""CREATE TABLE IF NOT EXISTS games (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        game_url TEXT UNIQUE,
-        played_at TEXT,
-        analyzed_at TEXT,
-        opening_name TEXT,
-        eco TEXT,
-        user_color TEXT,
-        result TEXT,
-        accuracy REAL,
-        blunders INTEGER,
-        mistakes INTEGER,
-        inaccuracies INTEGER,
-        weak_phase TEXT
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS blunders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        game_id INTEGER,
-        fen_before TEXT,
-        played_san TEXT,
-        best_san TEXT,
-        motif TEXT,
-        label TEXT,
-        cp_loss INTEGER,
-        FOREIGN KEY(game_id) REFERENCES games(id)
-    )""")
-    return conn
-
-def classify_result(side_result):
-    """Maps chess.com's granular result strings (win/checkmated/resigned/
-    timeout/agreed/repetition/stalemate/...) down to Win/Loss/Draw."""
-    if side_result == "win":
-        return "Win"
-    if side_result in ("agreed", "repetition", "stalemate", "insufficient", "50move", "timevsinsufficient"):
-        return "Draw"
-    return "Loss"
-
-def save_game_to_db(game_url, played_at, opening_name, eco, user_color, result,
-                     accuracy, counts, weak_phase, blunder_entries):
-    """Saves a completed analysis to history. Skips silently if this exact
-    game (by chess.com URL) was already saved, so re-analyzing the same
-    game twice doesn't create duplicates."""
-    try:
-        conn = get_db()
-        cur = conn.execute("SELECT id FROM games WHERE game_url = ?", (game_url,))
-        if cur.fetchone():
-            conn.close()
-            return
-        cur = conn.execute(
-            """INSERT INTO games (game_url, played_at, analyzed_at, opening_name, eco,
-               user_color, result, accuracy, blunders, mistakes, inaccuracies, weak_phase)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (game_url, played_at, datetime.now(timezone.utc).isoformat(), opening_name, eco,
-             user_color, result, accuracy, counts.get("Blunder", 0), counts.get("Mistake", 0),
-             counts.get("Inaccuracy", 0), weak_phase)
-        )
-        game_id = cur.lastrowid
-        for b in blunder_entries:
-            conn.execute(
-                """INSERT INTO blunders (game_id, fen_before, played_san, best_san, motif, label, cp_loss)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (game_id, b["fen_before"], b["san"], b["best_san"], b["motif"], b["label"], b["cp_loss"])
-            )
-        conn.commit()
-        conn.close()
-    except Exception:
-        pass  # history saving is a bonus feature — never let it break the main analysis flow
-
-
 
 # ---------- Chess.com / Lichess inspired theme ----------
 st.markdown("""
@@ -222,6 +136,63 @@ div.st-key-nav_buttons div.stButton > button {
   width: 100% !important;
   min-width: 0 !important;
   box-sizing: border-box !important;
+}
+
+/* Compact move-list rows: move number + white move + black move, all tight */
+div.st-key-move_list div[data-testid="stHorizontalBlock"] {
+  display: grid !important;
+  grid-template-columns: 0.6fr 1.5fr 1.5fr !important;
+  gap: 4px !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  margin-bottom: 2px !important;
+}
+div.st-key-move_list div[data-testid="column"] {
+  width: 100% !important;
+  min-width: 0 !important;
+  max-width: none !important;
+  flex: none !important;
+  padding: 0 !important;
+}
+div.st-key-move_list div.stButton > button {
+  padding: 2px 4px !important;
+  font-size: 0.85em !important;
+  width: 100% !important;
+  min-width: 0 !important;
+  box-sizing: border-box !important;
+}
+div.st-key-move_list .move-row-num {
+  font-size: 0.85em;
+  padding-top: 6px;
+  color: var(--cc-muted);
+}
+
+/* Compact flagged-moves rows: text + small "View" button, tight spacing */
+div.st-key-flagged_moves div[data-testid="stHorizontalBlock"] {
+  display: grid !important;
+  grid-template-columns: 1fr 0.35fr !important;
+  gap: 6px !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  align-items: center !important;
+  margin-bottom: 4px !important;
+}
+div.st-key-flagged_moves div[data-testid="column"] {
+  width: 100% !important;
+  min-width: 0 !important;
+  max-width: none !important;
+  flex: none !important;
+  padding: 0 !important;
+}
+div.st-key-flagged_moves div.stButton > button {
+  padding: 3px 4px !important;
+  font-size: 0.85em !important;
+  width: 100% !important;
+  min-width: 0 !important;
+  box-sizing: border-box !important;
+}
+div.st-key-flagged_moves .move-label {
+  font-size: 0.88em !important;
 }
 
 /* Compact horizontal stat strip for mobile — stays in one row, never stacks */
@@ -676,96 +647,6 @@ def go_start():
 def go_end():
     st.session_state.ply_index = len(st.session_state.analysis["positions"]) - 1
 
-# ---------- Trends & Puzzles (from saved history) ----------
-with st.expander("📈 Your progress across games"):
-    conn = get_db()
-    game_rows = conn.execute("SELECT * FROM games ORDER BY played_at ASC").fetchall()
-    blunder_rows = conn.execute("SELECT motif FROM blunders").fetchall()
-    conn.close()
-
-    if not game_rows:
-        st.caption("Analyze a few games below and your trends will show up here.")
-    else:
-        st.caption(f"Based on {len(game_rows)} analyzed game(s) saved so far.")
-
-        # Recurring blunder type across ALL games
-        motif_totals = {}
-        for row in blunder_rows:
-            motif = row["motif"]
-            motif_totals[motif] = motif_totals.get(motif, 0) + 1
-        if motif_totals:
-            st.write("**Your most common mistake types (all games):**")
-            sorted_motifs = dict(sorted(motif_totals.items(), key=lambda x: -x[1]))
-            st.bar_chart(sorted_motifs)
-
-        # Accuracy over time (all games, chronological)
-        if len(game_rows) >= 2:
-            st.write("**Accuracy trend over time:**")
-            accuracies = {i + 1: row["accuracy"] for i, row in enumerate(game_rows)}
-            st.line_chart(accuracies)
-
-        # Opening performance
-        opening_stats = {}
-        for row in game_rows:
-            opening = row["opening_name"]
-            acc = row["accuracy"]
-            result = row["result"]
-            if opening not in opening_stats:
-                opening_stats[opening] = {"count": 0, "acc_sum": 0, "wins": 0}
-            opening_stats[opening]["count"] += 1
-            opening_stats[opening]["acc_sum"] += acc
-            if result == "Win":
-                opening_stats[opening]["wins"] += 1
-
-        if opening_stats:
-            st.write("**Opening performance:**")
-            for opening, s in sorted(opening_stats.items(), key=lambda x: -x[1]["count"]):
-                avg_acc = s["acc_sum"] / s["count"]
-                win_rate = 100 * s["wins"] / s["count"]
-                st.write(f"- **{opening}** — {s['count']} game(s), {avg_acc:.0f}% avg accuracy, {win_rate:.0f}% win rate")
-
-with st.expander("🧩 Practice your own blunders"):
-    conn = get_db()
-    puzzle_rows = conn.execute(
-        "SELECT fen_before, played_san, best_san, motif FROM blunders ORDER BY RANDOM() LIMIT 1"
-    ).fetchall()
-    conn.close()
-
-    if not puzzle_rows:
-        st.caption("No blunders saved yet — analyze a game below, and any mistakes will show up here as puzzles to practice.")
-    else:
-        fen_before, played_san, best_san, motif = puzzle_rows[0]
-
-        if st.session_state.get("puzzle_fen") != fen_before:
-            st.session_state.puzzle_fen = fen_before
-            st.session_state.puzzle_best = best_san
-            st.session_state.puzzle_motif = motif
-            b = chess.Board(fen_before)
-            legal_sans = [b.san(m) for m in b.legal_moves]
-            distractors = [s for s in legal_sans if s != best_san]
-            random.shuffle(distractors)
-            options = [best_san] + distractors[:3]
-            random.shuffle(options)
-            st.session_state.puzzle_options = options
-            st.session_state.puzzle_answered = False
-
-        render_board(st.session_state.puzzle_fen, size=280)
-        st.write(f"**What's the best move here?** _(pattern: {st.session_state.puzzle_motif})_")
-
-        cols = st.columns(len(st.session_state.puzzle_options))
-        for i, opt in enumerate(st.session_state.puzzle_options):
-            if cols[i].button(opt, key=f"puzzle_opt_{i}", use_container_width=True):
-                st.session_state.puzzle_answered = opt
-
-        if st.session_state.get("puzzle_answered"):
-            if st.session_state.puzzle_answered == st.session_state.puzzle_best:
-                st.success(f"Correct! **{st.session_state.puzzle_best}** was the best move.")
-            else:
-                st.error(f"Not quite — the best move was **{st.session_state.puzzle_best}**.")
-            if st.button("Next puzzle"):
-                st.session_state.puzzle_fen = None
-                st.rerun()
-
 # ---------- Main flow ----------
 username = st.text_input("chess.com username")
 
@@ -867,34 +748,6 @@ if username:
                     entry["fen_before"], entry["san"], entry["best_san"],
                     entry["cp_loss"], entry["label"]
                 )
-
-            # Compute the same summary stats the display section will show,
-            # so history is saved in sync with what you actually see.
-            _user_moves = [p for p in positions if p["mover"] == "you"]
-            _counts = {}
-            for r in _user_moves:
-                _counts[r["label"]] = _counts.get(r["label"], 0) + 1
-            _total = len(_user_moves)
-            _accuracy = 100 * sum(1 for r in _user_moves if r["label"] in ("Best", "Good")) / _total if _total else 0
-            _weak_phase = max(phase_stats, key=lambda p: sum(phase_stats[p]) if phase_stats[p] else 0)
-
-            side_key = "white" if user_is_white else "black"
-            user_result = classify_result(selected_game.get(side_key, {}).get("result", ""))
-            end_ts = selected_game.get("end_time")
-            played_at = datetime.fromtimestamp(end_ts, tz=timezone.utc).isoformat() if end_ts else datetime.now(timezone.utc).isoformat()
-
-            save_game_to_db(
-                game_url=selected_game.get("url", f"unknown-{played_at}"),
-                played_at=played_at,
-                opening_name=opening_name,
-                eco=eco,
-                user_color="White" if user_is_white else "Black",
-                result=user_result,
-                accuracy=_accuracy,
-                counts=_counts,
-                weak_phase=_weak_phase,
-                blunder_entries=results,
-            )
 
         st.session_state.analysis = {
             "positions": positions, "results": results, "phase_stats": phase_stats,
@@ -1002,7 +855,7 @@ if "analysis" in st.session_state:
 
     with list_col:
         st.markdown("**Moves**")
-        with st.container(height=board_size + 40):
+        with st.container(height=board_size + 40, key="move_list"):
             # Build white/black pairs like a PGN panel
             ply = 1
             move_no = 1
@@ -1034,10 +887,11 @@ if "analysis" in st.session_state:
 
     st.divider()
     st.header("Flagged moves — click to jump")
-    for r in results:
-        cols = st.columns([5, 1])
-        cols[0].markdown(
-            f'<span class="move-label {r["cls"]}">{r["icon"]} Move {r["ply"]}: {r["san"]} — {r["label"]}</span>',
-            unsafe_allow_html=True
-        )
-        cols[1].button("View", key=f"jump_{r['ply']}", on_click=go_to, args=(r["ply"],), use_container_width=True)
+    with st.container(key="flagged_moves"):
+        for r in results:
+            cols = st.columns([5, 1])
+            cols[0].markdown(
+                f'<span class="move-label {r["cls"]}">{r["icon"]} Move {r["ply"]}: {r["san"]} — {r["label"]}</span>',
+                unsafe_allow_html=True
+            )
+            cols[1].button("View", key=f"jump_{r['ply']}", on_click=go_to, args=(r["ply"],), use_container_width=True)
